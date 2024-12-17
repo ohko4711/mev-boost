@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty="-dev")
-DOCKER_REPO := flashbots/mev-boost
+DOCKER_REPO := ohko4711/mev-boost
 
 # Set linker flags to:
 #   -w: disables DWARF debugging information.
@@ -81,7 +81,15 @@ docker-image:
 	DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --build-arg VERSION=${VERSION} . -t mev-boost
 	docker tag mev-boost:latest ${DOCKER_REPO}:${VERSION}
 	docker tag mev-boost:latest ${DOCKER_REPO}:latest
+	docker push ${DOCKER_REPO}:latest
 
+docker-image-multi:
+	docker buildx create --use --name multi-platform-builder || true
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		--build-arg VERSION=${VERSION} \
+		-t ${DOCKER_REPO}:${VERSION} \
+		-t ${DOCKER_REPO}:latest \
+		--push .
 .PHONY: clean
 clean:
 	git clean -fdx
