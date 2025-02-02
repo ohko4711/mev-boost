@@ -12,6 +12,7 @@ import (
 	builderApi "github.com/attestantio/go-builder-client/api"
 	denebApi "github.com/attestantio/go-builder-client/api/deneb"
 	builderSpec "github.com/attestantio/go-builder-client/spec"
+	eth2ApiV1Capella "github.com/attestantio/go-eth2-client/api/v1/capella"
 	eth2ApiV1Deneb "github.com/attestantio/go-eth2-client/api/v1/deneb"
 	eth2ApiV1Electra "github.com/attestantio/go-eth2-client/api/v1/electra"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -25,7 +26,8 @@ import (
 )
 
 type Payload interface {
-	*eth2ApiV1Deneb.SignedBlindedBeaconBlock |
+	*eth2ApiV1Capella.SignedBlindedBeaconBlock |
+		*eth2ApiV1Deneb.SignedBlindedBeaconBlock |
 		*eth2ApiV1Electra.SignedBlindedBeaconBlock
 }
 
@@ -39,8 +41,8 @@ var (
 
 func processPayload[P Payload](m *BoostService, log *logrus.Entry, ua UserAgent, blindedBlock P) (*builderApi.VersionedSubmitBlindedBlockResponse, bidResp) {
 	var (
-		slot      = slot[P](blindedBlock)
-		blockHash = blockHash[P](blindedBlock)
+		slot      = slot(blindedBlock)
+		blockHash = blockHash(blindedBlock)
 	)
 	// Get the currentSlotUID for this slot
 	currentSlotUID := ""
@@ -53,7 +55,7 @@ func processPayload[P Payload](m *BoostService, log *logrus.Entry, ua UserAgent,
 	m.slotUIDLock.Unlock()
 
 	// Prepare logger
-	log = prepareLogger[P](log, blindedBlock, ua, currentSlotUID)
+	log = prepareLogger(log, blindedBlock, ua, currentSlotUID)
 
 	// Log how late into the slot the request starts
 	slotStartTimestamp := m.genesisTime + slot*config.SlotTimeSec
@@ -110,7 +112,7 @@ func processPayload[P Payload](m *BoostService, log *logrus.Entry, ua UserAgent,
 				return
 			}
 
-			if err := verifyPayload[P](blindedBlock, log, responsePayload); err != nil {
+			if err := verifyPayload(blindedBlock, log, responsePayload); err != nil {
 				return
 			}
 
@@ -133,6 +135,13 @@ func processPayload[P Payload](m *BoostService, log *logrus.Entry, ua UserAgent,
 func verifyPayload[P Payload](payload P, log *logrus.Entry, response *builderApi.VersionedSubmitBlindedBlockResponse) error {
 	// Step 1: verify version
 	switch any(payload).(type) {
+	case *eth2ApiV1Capella.SignedBlindedBeaconBlock:
+		if response.Version != spec.DataVersionCapella {
+			log.WithFields(logrus.Fields{
+				"version": response.Version,
+			}).Error("response version was not capella")
+			return errInvalidVersion
+		}
 	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
 		if response.Version != spec.DataVersionDeneb {
 			log.WithFields(logrus.Fields{
@@ -155,38 +164,41 @@ func verifyPayload[P Payload](payload P, log *logrus.Entry, response *builderApi
 		return errEmptyPayload
 	}
 
-	// TODO(MariusVanDerWijden): make this generic once
-	// execution payload or blobs bundle change between forks.
-	var (
-		executionPayload *deneb.ExecutionPayload
-		blobs            *denebApi.BlobsBundle
-	)
-
-	switch any(payload).(type) {
+	// Step 3: verify post-conditions
+	switch block := any(payload).(type) {
+	case *eth2ApiV1Capella.SignedBlindedBeaconBlock:
+		if err := verifyBlockhash(log, payload, response.Capella.BlockHash); err != nil {
+			return err
+		}
 	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
-		executionPayload = response.Deneb.ExecutionPayload
-		blobs = response.Deneb.BlobsBundle
+		if err := verifyBlockhash(log, payload, response.Deneb.ExecutionPayload.BlockHash); err != nil {
+			return err
+		}
+		if err := verifyKZGCommitments(log, response.Deneb.BlobsBundle, block.Message.Body.BlobKZGCommitments); err != nil {
+			return err
+		}
 	case *eth2ApiV1Electra.SignedBlindedBeaconBlock:
-		executionPayload = response.Electra.ExecutionPayload
-		blobs = response.Electra.BlobsBundle
+		if err := verifyBlockhash(log, payload, response.Electra.ExecutionPayload.BlockHash); err != nil {
+			return err
+		}
+		if err := verifyKZGCommitments(log, response.Electra.BlobsBundle, block.Message.Body.BlobKZGCommitments); err != nil {
+			return err
+		}
 	}
+	return nil
+}
 
-	// Step 3: Ensure the response blockhash matches the request
-	if blockHash[P](payload) != executionPayload.BlockHash {
+func verifyBlockhash[P Payload](log *logrus.Entry, payload P, executionPayloadHash phase0.Hash32) error {
+	if blockHash(payload) != executionPayloadHash {
 		log.WithFields(logrus.Fields{
-			"responseBlockHash": executionPayload.String(),
+			"responseBlockHash": executionPayloadHash.String(),
 		}).Error("requestBlockHash does not equal responseBlockHash")
 		return errInvalidBlockhash
 	}
+	return nil
+}
 
-	// Step 4: Verify KZG commitments
-	var commitments []deneb.KZGCommitment
-	switch block := any(payload).(type) {
-	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
-		commitments = block.Message.Body.BlobKZGCommitments
-	case *eth2ApiV1Electra.SignedBlindedBeaconBlock:
-		commitments = block.Message.Body.BlobKZGCommitments
-	}
+func verifyKZGCommitments(log *logrus.Entry, blobs *denebApi.BlobsBundle, commitments []deneb.KZGCommitment) error {
 	// Ensure that blobs are valid and matches the request
 	if len(commitments) != len(blobs.Blobs) || len(commitments) != len(blobs.Commitments) || len(commitments) != len(blobs.Proofs) {
 		log.WithFields(logrus.Fields{
@@ -213,6 +225,14 @@ func verifyPayload[P Payload](payload P, log *logrus.Entry, response *builderApi
 
 func prepareLogger[P Payload](log *logrus.Entry, payload P, userAgent UserAgent, slotUID string) *logrus.Entry {
 	switch block := any(payload).(type) {
+	case *eth2ApiV1Capella.SignedBlindedBeaconBlock:
+		return log.WithFields(logrus.Fields{
+			"ua":         userAgent,
+			"slot":       block.Message.Slot,
+			"blockHash":  block.Message.Body.ExecutionPayloadHeader.BlockHash.String(),
+			"parentHash": block.Message.Body.ExecutionPayloadHeader.ParentHash.String(),
+			"slotUID":    slotUID,
+		})
 	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
 		return log.WithFields(logrus.Fields{
 			"ua":         userAgent,
@@ -235,6 +255,8 @@ func prepareLogger[P Payload](log *logrus.Entry, payload P, userAgent UserAgent,
 
 func slot[P Payload](payload P) uint64 {
 	switch block := any(payload).(type) {
+	case *eth2ApiV1Capella.SignedBlindedBeaconBlock:
+		return uint64(block.Message.Slot)
 	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
 		return uint64(block.Message.Slot)
 	case *eth2ApiV1Electra.SignedBlindedBeaconBlock:
@@ -245,6 +267,8 @@ func slot[P Payload](payload P) uint64 {
 
 func blockHash[P Payload](payload P) phase0.Hash32 {
 	switch block := any(payload).(type) {
+	case *eth2ApiV1Capella.SignedBlindedBeaconBlock:
+		return block.Message.Body.ExecutionPayloadHeader.BlockHash
 	case *eth2ApiV1Deneb.SignedBlindedBeaconBlock:
 		return block.Message.Body.ExecutionPayloadHeader.BlockHash
 	case *eth2ApiV1Electra.SignedBlindedBeaconBlock:
