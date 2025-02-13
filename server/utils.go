@@ -268,3 +268,7 @@ func getPayloadResponseIsEmpty(payload *builderApi.VersionedSubmitBlindedBlockRe
 	}
 	return false
 }
+
+func wrapUserAgent(ua UserAgent) string {
+	return strings.TrimSpace(fmt.Sprintf("mev-boost/%s %s", config.Version, ua))
+}
