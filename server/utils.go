@@ -50,21 +50,23 @@ func SendHTTPRequest(ctx context.Context, client http.Client, method, url string
 
 	if payload == nil {
 		req, err = http.NewRequestWithContext(ctx, method, url, nil)
+		if err != nil {
+			return 0, fmt.Errorf("could not prepare request: %w", err)
+		}
 	} else {
 		payloadBytes, err2 := json.Marshal(payload)
 		if err2 != nil {
 			return 0, fmt.Errorf("could not marshal request: %w", err2)
 		}
 		req, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(payloadBytes))
-
-		// Set headers
+		if err != nil {
+			return 0, fmt.Errorf("could not prepare request: %w", err)
+		}
+		// Set Content-Type header
 		req.Header.Add("Content-Type", "application/json")
 	}
-	if err != nil {
-		return 0, fmt.Errorf("could not prepare request: %w", err)
-	}
 
-	// Set user agent header
+	// Set User-Agent header
 	req.Header.Set("User-Agent", strings.TrimSpace(fmt.Sprintf("mev-boost/%s %s", config.Version, userAgent)))
 
 	// Set other headers
@@ -164,12 +166,6 @@ type bidResp struct {
 	relays   []types.RelayEntry
 }
 
-// bidRespKey is used as key for the bids cache
-type bidRespKey struct {
-	slot      uint64
-	blockHash string
-}
-
 // bidInfo is used to store bid response fields for logging and validation
 type bidInfo struct {
 	blockHash   phase0.Hash32
@@ -217,15 +213,14 @@ func parseBidInfo(bid *builderSpec.VersionedSignedBuilderBid) (bidInfo, error) {
 	if err != nil {
 		return bidInfo{}, err
 	}
-	bidInfo := bidInfo{
+	return bidInfo{
 		blockHash:   blockHash,
 		parentHash:  parentHash,
 		pubkey:      pubkey,
 		blockNumber: blockNumber,
 		txRoot:      txRoot,
 		value:       value,
-	}
-	return bidInfo, nil
+	}, nil
 }
 
 func checkRelaySignature(bid *builderSpec.VersionedSignedBuilderBid, domain phase0.Domain, pubKey phase0.BLSPubKey) (bool, error) {
@@ -248,14 +243,32 @@ func checkRelaySignature(bid *builderSpec.VersionedSignedBuilderBid, domain phas
 
 func getPayloadResponseIsEmpty(payload *builderApi.VersionedSubmitBlindedBlockResponse) bool {
 	switch payload.Version {
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.BlockHash == nilHash {
+			return true
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.BlockHash == nilHash {
+			return true
+		}
 	case spec.DataVersionDeneb:
 		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil ||
 			payload.Deneb.ExecutionPayload.BlockHash == nilHash ||
 			payload.Deneb.BlobsBundle == nil {
 			return true
 		}
-	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix, spec.DataVersionCapella:
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil ||
+			payload.Electra.ExecutionPayload.BlockHash == nilHash ||
+			payload.Electra.BlobsBundle == nil {
+			return true
+		}
+	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair:
 		return true
 	}
 	return false
+}
+
+func wrapUserAgent(ua UserAgent) string {
+	return strings.TrimSpace(fmt.Sprintf("mev-boost/%s %s", config.Version, ua))
 }
